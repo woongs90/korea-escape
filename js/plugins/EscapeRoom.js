@@ -1,6 +1,6 @@
 //=============================================================================
 // EscapeRoom.js  (RPG Maker MV)
-// 걸어 다니며 조사하는 방탈출 엔진 v2.5 (모바일 터치 지원)
+// 걸어 다니며 조사하는 방탈출 엔진 v2.6 (모바일 터치 · 화면 비율 자동 맞춤)
 //=============================================================================
 /*:
  * @plugindesc 걸어 다니며 조사하는 방탈출 엔진 - 이벤트 이름과 데이터 파일 하나로 단서, 자물쇠, 퀴즈를 만듭니다.
@@ -48,6 +48,21 @@
  * @text 효과음: 시대 이동
  * @default Move1
  *
+ * @param AutoWidth
+ * @text 화면 비율 자동 맞춤
+ * @type boolean
+ * @on 자동
+ * @off 끄기(기본 크기)
+ * @desc 켜면 기기 화면 비율에 맞춰 화면 가로 크기를 정합니다(세로 624 고정). 지도는 가운데에 고정됩니다.
+ * @default true
+ *
+ * @param MaxWidth
+ * @text 가장 넓은 화면 가로(px)
+ * @type number
+ * @min 816
+ * @desc 자동 맞춤일 때 화면 가로의 최댓값. 지도 가로 칸 수 x 48 이하로 두세요. (29칸 지도 = 1392)
+ * @default 1392
+ *
  * @help
  * ============================================================================
  *  사용 방법 (자세한 내용은 함께 드린 안내서를 보세요)
@@ -81,10 +96,19 @@
  *  - 데이터 파일의 "review": { "url": "...", "picture": "...", "text": "..." }
  *    엔딩 정리가 끝난 뒤 안내 화면이 나오고, Enter·클릭을 누르는 순간 링크가 열립니다.
  *  - 단계에 "openUrl"을 붙여도 같은 방식으로 링크를 엽니다.
+ *
+ *  v2.6 화면 비율 자동 맞춤
+ *  - 기기(창) 비율에 맞춰 화면 가로를 816~MaxWidth 사이에서 정합니다.
+ *    4:3 태블릿은 816, 16:9 크롬북은 약 1104, 휴대폰 가로는 약 1300.
+ *  - 지도는 언제나 가운데에 고정됩니다. 지도를 화면보다 넓게(예: 29칸) 만들고
+ *    가운데 17칸에 꼭 필요한 것을 두면, 넓은 화면에서는 양옆 장식이 더 보입니다.
+ *  - 화면을 돌리거나 창 크기를 바꾸면, 타이틀 화면이나 자유롭게 걷는 중일 때
+ *    자동으로 다시 맞춥니다.
+ *  - 휴대폰·태블릿: 톡 눌러 이동/조사, 창 바깥을 누르면 닫기, 세로일 때 가로 안내.
  */
 
 var Imported = Imported || {};
-Imported.EscapeRoom = '2.4.0';
+Imported.EscapeRoom = '2.6.0';
 
 var $dataEscape = null;
 var EscapeManager = null;
@@ -102,8 +126,143 @@ var EscapeManager = null;
     var SE_GATE = params['SeGate'] === undefined ? 'Teleport' : String(params['SeGate']);
     var SE_WARP = params['SeWarp'] === undefined ? 'Move1' : String(params['SeWarp']);
 
+    var AUTO_WIDTH = String(params['AutoWidth']) !== 'false';
+    var MAX_WIDTH = Math.max(816, Number(params['MaxWidth'] || 1392));
+    var BASE_W = 816, BASE_H = 624;
+
     var HUD_H = 40;
     var MSG_LINES = 3;
+
+    //=========================================================================
+    // 화면 비율 자동 맞춤
+    //=========================================================================
+    function escTargetWidth() {
+        var w = window.innerWidth || BASE_W, h = window.innerHeight || BASE_H;
+        var t = Math.round(BASE_H * (w / h) / 2) * 2;
+        return Math.max(BASE_W, Math.min(MAX_WIDTH, t));
+    }
+
+    // 휴대폰에서 실제 화면 크기를 재도록 viewport 설정 (MV 기본 index.html은 980px 가상 화면)
+    if (AUTO_WIDTH) {
+        try {
+            var vm = document.querySelector('meta[name="viewport"]');
+            if (!vm) { vm = document.createElement('meta'); vm.name = 'viewport'; document.head.appendChild(vm); }
+            vm.setAttribute('content', 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover');
+        } catch (e) {}
+    }
+
+    // 자동 맞춤일 때는 컴퓨터 브라우저에서도 창 크기에 맞춰 확대/축소 (MV 기본은 휴대폰·NW.js만)
+    if (AUTO_WIDTH) {
+        Graphics._defaultStretchMode = function() { return true; };
+    }
+
+    var _SceneManager_initGraphics = SceneManager.initGraphics;
+    SceneManager.initGraphics = function() {
+        if (AUTO_WIDTH) {
+            var tw = escTargetWidth();
+            this._screenWidth = this._boxWidth = tw;
+            this._screenHeight = this._boxHeight = BASE_H;
+        }
+        _SceneManager_initGraphics.call(this);
+    };
+
+    // 실행 중에 화면을 돌리거나 창 크기가 바뀌면: 안전한 순간에 다시 맞춤
+    var escResize = { pending: 0, timer: null };
+    function escApplyWidth(tw) {
+        SceneManager._screenWidth = SceneManager._boxWidth = tw;
+        Graphics.boxWidth = tw;
+        Graphics.width = tw;
+        escResize.pending = 0;
+    }
+    if (AUTO_WIDTH) {
+        window.addEventListener('resize', function() {
+            clearTimeout(escResize.timer);
+            escResize.timer = setTimeout(function() {
+                if (!Graphics._renderer) return;
+                var tw = escTargetWidth();
+                escResize.pending = Math.abs(tw - Graphics.width) >= 16 ? tw : 0;
+            }, 350);
+        });
+    }
+
+    var _Scene_Title_update = Scene_Title.prototype.update;
+    Scene_Title.prototype.update = function() {
+        _Scene_Title_update.call(this);
+        if (escResize.pending && this.isActive() && !SceneManager.isSceneChanging()) {
+            escApplyWidth(escResize.pending);
+            SceneManager.goto(Scene_Title);
+        }
+    };
+
+    function escMapResizeSafe(scene) {
+        var M = EscapeManager;
+        if (!scene.isActive() || SceneManager.isSceneChanging()) return false;
+        if ($gamePlayer.isMoving() || $gamePlayer.isTransferring() || $gameMap.isEventRunning()) return false;
+        if (!M || !M.isActive()) return true;
+        return M._phase === 'play' && M.canInteract() && !M._bagOpen;
+    }
+
+    // 지도 가운데 고정 (지도가 화면보다 넓으면 양옆이 똑같이 잘려 보임)
+    function escCenteredMap() {
+        if (!$dataMap) return false;
+        return /<escCenter>/i.test($dataMap.note || '') || (EscapeManager && EscapeManager.isActive && EscapeManager.isActive());
+    }
+    // 지도가 화면보다 좁으면(예: 예전 17칸 지도) 가운데에 두고 양옆은 검게 가립니다.
+    // (원경 그림이 옆으로 반복되어 방이 여러 개처럼 보이는 것을 막음)
+    Game_Map.prototype.escCenterView = function() {
+        var dx = (this.width() - this.screenTileX()) / 2;
+        var dy = (this.height() - this.screenTileY()) / 2;
+        this._displayX = dx;
+        this._displayY = dy;
+        this._parallaxX = dx;
+        this._parallaxY = dy;
+    };
+
+    var _Spriteset_Map_createParallax = Spriteset_Map.prototype.createParallax;
+    Spriteset_Map.prototype.createParallax = function() {
+        _Spriteset_Map_createParallax.call(this);
+        this._escBars = new PIXI.Graphics();
+        this._escBarsKey = '';
+        this._baseSprite.addChild(this._escBars);
+    };
+
+    var _Spriteset_Map_update = Spriteset_Map.prototype.update;
+    Spriteset_Map.prototype.update = function() {
+        _Spriteset_Map_update.call(this);
+        this.escUpdateBars();
+    };
+
+    Spriteset_Map.prototype.escUpdateBars = function() {
+        var g = this._escBars;
+        if (!g) return;
+        var tw = $gameMap.tileWidth(), th = $gameMap.tileHeight();
+        var left = Math.round(-$gameMap.displayX() * tw);          // 지도 왼쪽 끝의 화면 x
+        var right = left + $gameMap.width() * tw;
+        var top = Math.round(-$gameMap.displayY() * th);
+        var bottom = top + $gameMap.height() * th;
+        var W = Graphics.width, H = Graphics.height;
+        var key = [left, right, top, bottom, W, H].join(',');
+        if (key === this._escBarsKey) return;
+        this._escBarsKey = key;
+        g.clear();
+        if ($gameMap.isLoopHorizontal() || $gameMap.isLoopVertical()) return;
+        g.beginFill(0x000000, 1);
+        if (left > 0) g.drawRect(0, 0, left, H);
+        if (right < W) g.drawRect(right, 0, W - right, H);
+        if (top > 0) g.drawRect(0, 0, W, top);
+        if (bottom < H) g.drawRect(0, bottom, W, H - bottom);
+        g.endFill();
+    };
+    var _Game_Player_center = Game_Player.prototype.center;
+    Game_Player.prototype.center = function(x, y) {
+        if (escCenteredMap()) return $gameMap.escCenterView();
+        return _Game_Player_center.call(this, x, y);
+    };
+    var _Game_Player_updateScroll = Game_Player.prototype.updateScroll;
+    Game_Player.prototype.updateScroll = function(lastX, lastY) {
+        if (escCenteredMap()) return $gameMap.escCenterView();
+        _Game_Player_updateScroll.call(this, lastX, lastY);
+    };
 
     function SW() { return Graphics.boxWidth; }
     function SH() { return Graphics.boxHeight; }
@@ -266,7 +425,17 @@ var EscapeManager = null;
     Scene_Title.prototype.createBackground = function() {
         var d = escData();
         if (d && hasAsset('title', d.titleImage)) {
-            this._backSprite1 = new Sprite(ImageManager.loadTitle1(d.titleImage));
+            var bmp = ImageManager.loadTitle1(d.titleImage);
+            this._backSprite1 = new Sprite(bmp);
+            this._backSprite1.anchor.x = 0.5;
+            this._backSprite1.anchor.y = 0.5;
+            this._backSprite1.x = Graphics.width / 2;
+            this._backSprite1.y = Graphics.height / 2;
+            var spr = this._backSprite1;
+            bmp.addLoadListener(function() {
+                var sc = Math.max(1, Graphics.width / bmp.width, Graphics.height / bmp.height);
+                spr.scale.x = spr.scale.y = sc;
+            });
             this._backSprite2 = new Sprite();
             this.addChild(this._backSprite1);
             this.addChild(this._backSprite2);
@@ -309,6 +478,63 @@ var EscapeManager = null;
         _Scene_Title_start.call(this);
         var d = escData();
         if (d && d.gameTitle) document.title = d.gameTitle;
+    };
+
+    // 타이틀: 새 게임/계속/옵션 메뉴 대신 "화면을 클릭하세요" 안내 → 누르면 바로 시작
+    var _Scene_Title_createCommandWindow = Scene_Title.prototype.createCommandWindow;
+    Scene_Title.prototype.createCommandWindow = function() {
+        _Scene_Title_createCommandWindow.call(this);
+        if (!escData()) return;
+        this._commandWindow.visible = false;
+        this._commandWindow.deactivate();
+        this._escPressFrames = 0;
+        var touch = Utils.isMobileDevice() || ('ontouchstart' in window) || (navigator.maxTouchPoints > 1);
+        var text = touch ? '게임을 시작하려면 화면을 터치하세요' : '게임을 시작하려면 화면을 클릭하세요';
+        var bw = 520, bh = 56;
+        var bmp = new Bitmap(bw, bh);
+        roundRect(bmp, 2, 2, bw - 4, bh - 4, 26, 'rgba(12,10,20,0.62)', 'rgba(255,226,150,0.85)', 2);
+        bmp.fontSize = 26;
+        bmp.textColor = '#ffe9b0';
+        bmp.outlineColor = 'rgba(0,0,0,0.7)';
+        bmp.outlineWidth = 4;
+        bmp.drawText(text, 0, 0, bw, bh, 'center');
+        var sp = new Sprite(bmp);
+        sp.anchor.x = 0.5;
+        sp.anchor.y = 0.5;
+        sp.x = Graphics.width / 2;
+        sp.y = Math.round(Graphics.height * 0.74);
+        this._escPress = sp;
+        this.addChild(sp);
+    };
+
+    var _Scene_Title_updateTitlePress = Scene_Title.prototype.update;
+    Scene_Title.prototype.update = function() {
+        if (this._escPress) {
+            this._commandWindow.visible = false;
+            this._commandWindow.deactivate();
+            this._commandWindow.openness = 0;
+        }
+        _Scene_Title_updateTitlePress.call(this);
+        if (!this._escPress) return;
+        this._escPressFrames++;
+        this._escPress.opacity = 150 + Math.round(105 * Math.abs(Math.sin(this._escPressFrames / 28)));
+        if (this._escStarting || !this.isActive() || this.isBusy() || SceneManager.isSceneChanging()) return;
+        if (this._escPressFrames > 15 && (Input.isTriggered('ok') || TouchInput.isTriggered())) {
+            this._escStarting = true;
+            this._escPress.visible = false;
+            SoundManager.playOk();
+            this.commandNewGame();
+        }
+    };
+
+    // 대시(Shift, 클릭 이동 시 자동 달리기) 끄기
+    var _Game_Player_updateDashing = Game_Player.prototype.updateDashing;
+    Game_Player.prototype.updateDashing = function() {
+        if (EscapeManager && EscapeManager.isActive && EscapeManager.isActive()) {
+            this._dashing = false;
+            return;
+        }
+        _Game_Player_updateDashing.call(this);
     };
 
     //=========================================================================
@@ -1643,6 +1869,10 @@ var EscapeManager = null;
             this._waiting = true;
             this._movie = { frames: 0 };
             Graphics._escVideoCancelled = false;
+            if (Graphics._video) {
+                Graphics._video.style.objectFit = 'contain';
+                Graphics._video.style.background = '#000';
+            }
             Graphics.playVideo('movies/' + encodeURIComponent(name) + videoExt());
             return true;
         },
@@ -2244,6 +2474,12 @@ var EscapeManager = null;
     var _Scene_Map_update = Scene_Map.prototype.update;
     Scene_Map.prototype.update = function() {
         _Scene_Map_update.call(this);
+        if (escResize.pending && escMapResizeSafe(this)) {
+            escApplyWidth(escResize.pending);
+            $gamePlayer.center($gamePlayer.x, $gamePlayer.y);
+            SceneManager.goto(Scene_Map);
+            return;
+        }
         if (!EscapeManager.isActive() || !this._escHud) return;
         EscapeManager.update(this);
         if (EscapeManager.openBagAfter && EscapeManager.canInteract()) {
