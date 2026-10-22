@@ -1,6 +1,6 @@
 //=============================================================================
 // EscapeRoom.js  (RPG Maker MV)
-// 걸어 다니며 조사하는 방탈출 엔진 v2.0
+// 걸어 다니며 조사하는 방탈출 엔진 v2.5 (모바일 터치 지원)
 //=============================================================================
 /*:
  * @plugindesc 걸어 다니며 조사하는 방탈출 엔진 - 이벤트 이름과 데이터 파일 하나로 단서, 자물쇠, 퀴즈를 만듭니다.
@@ -145,6 +145,27 @@ var EscapeManager = null;
     var EscapeAssets = {};
     var _assetState = 'idle';
     var _assetPending = 0;
+
+    // 창 바깥을 톡 눌렀는지 (단서 그림 위를 누른 것은 제외)
+    function escTappedOutside(win) {
+        if (!TouchInput.isTriggered()) return false;
+        var lx = win.canvasToLocalX(TouchInput.x), ly = win.canvasToLocalY(TouchInput.y);
+        if (lx >= 0 && ly >= 0 && lx < win.width && ly < win.height) return false;
+        if (TouchInput.y < HUD_H) return false;
+        var sc = SceneManager._scene, cu = sc && sc._escCloseup;
+        if (cu && cu.visible && cu.bitmap && cu.bitmap.width) {
+            var w = cu.bitmap.width * cu.scale.x, h = cu.bitmap.height * cu.scale.y;
+            if (Math.abs(TouchInput.x - cu.x) < w / 2 && Math.abs(TouchInput.y - cu.y) < h / 2) return false;
+        }
+        return true;
+    }
+
+    // 건너뛴 영상이 MV의 재시도 타이머로 다시 시작되지 않도록
+    var _Graphics_playVideoInner = Graphics._playVideo;
+    Graphics._playVideo = function(src) {
+        if (this._escVideoCancelled) return;
+        _Graphics_playVideoInner.call(this, src);
+    };
 
     function videoExt() {
         return Game_Interpreter.prototype.videoFileExt.call(null);
@@ -1030,6 +1051,9 @@ var EscapeManager = null;
         } else if (Input.isTriggered('cancel') || TouchInput.isCancelled()) {
             SoundManager.playCancel();
             this.callHandler('cancel');
+        } else if (escTappedOutside(this)) {
+            SoundManager.playCancel();
+            this.callHandler('cancel');
         } else if (TouchInput.isTriggered()) {
             this.onClick(this.canvasToLocalX(TouchInput.x) - this.padding, this.canvasToLocalY(TouchInput.y) - this.padding);
         }
@@ -1172,6 +1196,10 @@ var EscapeManager = null;
         var _processTouch = Klass.prototype.processTouch;
         Klass.prototype.processTouch = function() {
             if (this._openFrame === Graphics.frameCount) return;
+            if (this.isOpenAndActive() && this.isCancelEnabled() && escTappedOutside(this)) {
+                this.processCancel();
+                return;
+            }
             _processTouch.call(this);
         };
     });
@@ -1614,6 +1642,7 @@ var EscapeManager = null;
             AudioManager.stopBgm();
             this._waiting = true;
             this._movie = { frames: 0 };
+            Graphics._escVideoCancelled = false;
             Graphics.playVideo('movies/' + encodeURIComponent(name) + videoExt());
             return true;
         },
@@ -1624,9 +1653,12 @@ var EscapeManager = null;
             var v = Graphics._video;
             var skip = m.frames > 20 && (Input.isTriggered('ok') || Input.isTriggered('cancel') ||
                 TouchInput.isTriggered() || TouchInput.isCancelled());
-            var stalled = m.frames > 150 && v && v.paused && !Graphics._videoLoading && v.currentTime === 0;
+            var stalled = (m.frames > 150 && v && v.paused && !Graphics._videoLoading && v.currentTime === 0) ||
+                (m.frames > 360 && v && (v.error || v.currentTime === 0));
             if ((skip || stalled) && Graphics.isVideoPlaying()) {
-                if (v) v.pause();
+                if (v) { v.pause(); v.onerror = null; v.removeAttribute('src'); try { v.load(); } catch (e) {} }
+                Graphics._escVideoCancelled = true;
+                Graphics._videoLoading = false;
                 Graphics._onVideoEnd();
             }
             if (m.frames > 10 && !Graphics.isVideoPlaying()) {
@@ -2798,4 +2830,44 @@ var EscapeManager = null;
             bmp.drawText('이벤트가 없는 조사 지점: ' + missing.join(', '), 10, SH() - 34, SW() - 232, 30, 'left');
         }
     };
+    //=========================================================================
+    // 휴대폰·태블릿을 세로로 들었을 때 "가로로 돌려 주세요" 안내
+    //=========================================================================
+    (function() {
+        var box = null, dismissed = false;
+        function isTouchDevice() {
+            return Utils.isMobileDevice() || ('ontouchstart' in window) || (navigator.maxTouchPoints > 1);
+        }
+        function block(e) { e.stopPropagation(); }
+        function check() {
+            var show = !dismissed && isTouchDevice() && window.innerHeight > window.innerWidth * 1.05;
+            if (!box) {
+                if (!show) return;
+                box = document.createElement('div');
+                box.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:200;display:flex;' +
+                    'flex-direction:column;align-items:center;justify-content:center;background:rgba(12,10,8,0.92);' +
+                    'color:#ffe9b0;font-family:GameFont,sans-serif;text-align:center;';
+                box.innerHTML = '<div style="font-size:20vmin;line-height:1">&#x1F4F1;&#x21BB;</div>' +
+                    '<div style="font-size:7vmin;margin-top:4vmin">화면을 <b>가로</b>로 돌려 주세요</div>' +
+                    '<div style="font-size:4.2vmin;margin-top:2vmin;color:#cdbf9f;line-height:1.5">가로로 들면 게임 화면이 훨씬 크게 보여요.<br>' +
+                    '(화면 자동 회전이 꺼져 있다면 켜 주세요)</div>' +
+                    '<div id="escRotateSkip" style="margin-top:7vmin;padding:2.5vmin 6vmin;border:1px solid #8a7a5a;' +
+                    'border-radius:2vmin;font-size:4.5vmin;color:#ffffff">그냥 세로로 할래요</div>';
+                ['touchstart', 'touchmove', 'touchend', 'mousedown', 'mouseup', 'pointerdown', 'wheel'].forEach(function(n) {
+                    box.addEventListener(n, block);
+                });
+                var skip = box.querySelector('#escRotateSkip');
+                var onSkip = function(e) { e.preventDefault(); e.stopPropagation(); dismissed = true; check(); };
+                skip.addEventListener('touchend', onSkip);
+                skip.addEventListener('click', onSkip);
+                document.body.appendChild(box);
+            }
+            box.style.setProperty('z-index', '1000', 'important');
+            box.style.display = show ? 'flex' : 'none';
+        }
+        window.addEventListener('resize', check);
+        window.addEventListener('orientationchange', function() { setTimeout(check, 300); });
+        window.addEventListener('load', check);
+        setTimeout(check, 0);
+    })();
 })();
